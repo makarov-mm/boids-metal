@@ -7,7 +7,7 @@ bright-pass, a temporal **motion-trail** feedback, a separable Gaussian
 you can **drag around the tank with the mouse in real time**, and the core
 flocking/visual parameters are exposed as **live SwiftUI sliders**.
 
-![swarm](screenshot.png)
+![swarm](screenshot1.png)
 
 ## Build
 
