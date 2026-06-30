@@ -2,10 +2,13 @@ import simd
 
 // Mirror of the Metal `SimParams` struct. Every field is a 4-byte scalar so
 // the memory layout matches the shader exactly with no padding surprises.
+// Obstacles are no longer a single hard-coded sphere — they live in their own
+// `float4` buffer (xyz = centre, w = radius); only the *count*, a global
+// avoidance weight and a margin live here.
 struct SimParams {
-    var count: UInt32 = 12000
+    var count: UInt32 = 16000
     var predatorCount: UInt32 = 3
-    var obstacleOn: UInt32 = 0
+    var obstacleCount: UInt32 = 0
     var dt: Float = 0.1
 
     var perception: Float = 9.5
@@ -20,16 +23,17 @@ struct SimParams {
     var wBounds: Float = 2.5
     var wFlee: Float = 4.0
 
-    var bMinX: Float = 0,   bMinY: Float = 0,  bMinZ: Float = 0
-    var bMaxX: Float = 140, bMaxY: Float = 90, bMaxZ: Float = 140
-    var margin: Float = 12.0
+    // Bigger tank than the original 140×90×140 — more room for the swarm to
+    // spread, split and re-form. Camera auto-fits from these bounds.
+    var bMinX: Float = 0,   bMinY: Float = 0,   bMinZ: Float = 0
+    var bMaxX: Float = 220, bMaxY: Float = 140, bMaxZ: Float = 220
+    var margin: Float = 14.0
 
     var predMaxSpeed: Float = 17.0
     var predMaxForce: Float = 0.7
     var fleeRadius: Float = 14.0
 
-    var obsX: Float = 70, obsY: Float = 45, obsZ: Float = 70
-    var obsRadius: Float = 14.0
+    var obsRadius: Float = 16.0   // global radius pushed into every obstacle
     var wObstacle: Float = 3.5
 
     var boundsMin: SIMD3<Float> { SIMD3(bMinX, bMinY, bMinZ) }

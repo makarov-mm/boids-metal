@@ -18,7 +18,7 @@ final class OrbitCamera {
 
     func zoom(_ delta: Float) {
         distance *= (1 - delta * 0.1)
-        distance = max(20, min(900, distance))
+        distance = max(20, min(1400, distance))
     }
 
     func eye() -> SIMD3<Float> {
@@ -30,7 +30,7 @@ final class OrbitCamera {
 
     func viewProj() -> float4x4 {
         let e = eye()
-        let proj = perspective(fovyRadians: fovy, aspect: aspect, near: 1, far: 1600)
+        let proj = perspective(fovyRadians: fovy, aspect: aspect, near: 1, far: 2400)
         let view = lookAt(eye: e, center: target, up: SIMD3(0, 1, 0))
         return proj * view
     }

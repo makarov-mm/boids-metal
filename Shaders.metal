@@ -3,10 +3,17 @@
 // Simulation runs entirely on the GPU as an N-body-style brute-force kernel
 // with threadgroup tiling (each thread cooperatively loads a tile of boids
 // into threadgroup memory, then every thread reads the tile from there).
-// For 12k boids this is far cheaper than a CPU hash grid on Apple Silicon and
-// keeps the code dependency-free. Rendering is instanced camera-facing
-// arrowheads into an HDR target, followed by a bright-pass + separable
-// Gaussian bloom and an ACES tone-map composite.
+// For ~16k boids this is far cheaper than a CPU hash grid on Apple Silicon and
+// keeps the code dependency-free.
+//
+// Obstacles are real, opaque, lit spheres now: boids both steer away from them
+// (soft force) and are physically pushed out of them (hard, non-penetrating
+// constraint), so nothing is ever seen inside the solid geometry. They can be
+// dragged at runtime, so their positions/radii arrive in a small float4 buffer.
+//
+// Rendering is instanced camera-facing arrowheads into an HDR target, followed
+// by a bright-pass, a temporal trail-accumulation feedback, a separable
+// Gaussian blur and an ACES tone-map composite.
 
 #include <metal_stdlib>
 using namespace metal;
@@ -17,7 +24,7 @@ using namespace metal;
 struct SimParams {
     uint  count;
     uint  predatorCount;
-    uint  obstacleOn;
+    uint  obstacleCount;
     float dt;
     float perception;
     float sepDist;
@@ -35,7 +42,6 @@ struct SimParams {
     float predMaxSpeed;
     float predMaxForce;
     float fleeRadius;
-    float obsX, obsY, obsZ;
     float obsRadius;
     float wObstacle;
 };
@@ -61,12 +67,13 @@ constant uint TILE = 256;
 
 // ===================== SIMULATION =====================
 
-kernel void boids_update(device const float3* posIn   [[buffer(0)]],
-                         device const float3* velIn   [[buffer(1)]],
-                         device float3*       posOut  [[buffer(2)]],
-                         device float3*       velOut  [[buffer(3)]],
-                         device const float3* predPos [[buffer(4)]],
-                         constant SimParams&  P       [[buffer(8)]],
+kernel void boids_update(device const float3* posIn     [[buffer(0)]],
+                         device const float3* velIn     [[buffer(1)]],
+                         device float3*       posOut    [[buffer(2)]],
+                         device float3*       velOut    [[buffer(3)]],
+                         device const float3* predPos   [[buffer(4)]],
+                         constant SimParams&  P         [[buffer(8)]],
+                         device const float4* obstacles [[buffer(9)]],
                          uint gid [[thread_position_in_grid]],
                          uint lid [[thread_position_in_threadgroup]])
 {
@@ -145,26 +152,45 @@ kernel void boids_update(device const float3* posIn   [[buffer(0)]],
     if (pi.z < bmin.z + P.margin) b.z += 1; else if (pi.z > bmax.z - P.margin) b.z -= 1;
     if (dot(b, b) > 0) acc += setMag(b, P.maxForce) * P.wBounds;
 
-    // optional spherical obstacle
-    if (P.obstacleOn != 0) {
-        float3 oc = float3(P.obsX, P.obsY, P.obsZ);
-        float3 d = pi - oc;
+    // soft avoidance of every solid obstacle
+    for (uint k = 0; k < P.obstacleCount; ++k) {
+        float4 ob = obstacles[k];
+        float3 d = pi - ob.xyz;
         float dist = length(d);
-        float safe = P.obsRadius + P.margin;
+        float safe = ob.w + P.margin;
         if (dist < safe && dist > 1e-4) {
             float s = (safe - dist) / safe;
             acc += setMag(d, P.maxForce) * (P.wObstacle * s);
         }
     }
 
+    // symplectic (semi-implicit) Euler: integrate position with the *new*
+    // velocity — cheaper than RK and stays stable at these timesteps.
     float3 v = vi + acc;
     float sp = length(v);
-    if (sp > P.maxSpeed)               v *= P.maxSpeed / sp;
-    else if (sp < P.minSpeed && sp > 1e-5) v *= P.minSpeed / sp;
+    if (sp > P.maxSpeed)                    v *= P.maxSpeed / sp;
+    else if (sp < P.minSpeed && sp > 1e-5)  v *= P.minSpeed / sp;
+
+    float3 newPos = pi + v * P.dt;
+
+    // hard, non-penetrating collision: if a boid ends up inside a solid
+    // sphere, snap it to the surface and remove the inward velocity so it
+    // slides along instead of tunnelling through.
+    for (uint k = 0; k < P.obstacleCount; ++k) {
+        float4 ob = obstacles[k];
+        float3 d = newPos - ob.xyz;
+        float dist = length(d);
+        if (dist < ob.w && dist > 1e-5) {
+            float3 n = d / dist;
+            newPos = ob.xyz + n * ob.w;
+            float vn = dot(v, n);
+            if (vn < 0) v -= n * vn;
+        }
+    }
 
     if (active) {
         velOut[gid] = v;
-        posOut[gid] = pi + v * P.dt;
+        posOut[gid] = newPos;
     }
 }
 
@@ -174,6 +200,7 @@ kernel void predators_update(device const float3* posIn      [[buffer(0)]],
                              device float3*       predPosOut [[buffer(6)]],
                              device float3*       predVelOut [[buffer(7)]],
                              constant SimParams&  P          [[buffer(8)]],
+                             device const float4* obstacles  [[buffer(9)]],
                              uint gid [[thread_position_in_grid]])
 {
     if (gid >= P.predatorCount) return;
@@ -201,12 +228,37 @@ kernel void predators_update(device const float3* posIn      [[buffer(0)]],
     if (pk.z < bmin.z + P.margin) b.z += 1; else if (pk.z > bmax.z - P.margin) b.z -= 1;
     if (dot(b, b) > 0) acc += setMag(b, P.predMaxForce) * 2.5;
 
+    // predators also steer around the solid spheres
+    for (uint k = 0; k < P.obstacleCount; ++k) {
+        float4 ob = obstacles[k];
+        float3 d = pk - ob.xyz;
+        float dist = length(d);
+        float safe = ob.w + P.margin;
+        if (dist < safe && dist > 1e-4) {
+            float s = (safe - dist) / safe;
+            acc += setMag(d, P.predMaxForce) * (3.0 * s);
+        }
+    }
+
     float3 v = predVelIn[gid] + acc;
     float sp = length(v);
     if (sp > P.predMaxSpeed) v *= P.predMaxSpeed / sp;
 
+    float3 newPos = pk + v * P.dt;
+    for (uint k = 0; k < P.obstacleCount; ++k) {
+        float4 ob = obstacles[k];
+        float3 d = newPos - ob.xyz;
+        float dist = length(d);
+        if (dist < ob.w && dist > 1e-5) {
+            float3 n = d / dist;
+            newPos = ob.xyz + n * ob.w;
+            float vn = dot(v, n);
+            if (vn < 0) v -= n * vn;
+        }
+    }
+
     predVelOut[gid] = v;
-    predPosOut[gid] = pk + v * P.dt;
+    predPosOut[gid] = newPos;
 }
 
 // ===================== SCENE RENDER =====================
@@ -269,6 +321,50 @@ fragment float4 boid_fragment(VSOut in [[stage_in]]) {
     return float4(in.color, 1.0);
 }
 
+// ---- solid, opaque, lit obstacle spheres ----
+struct ObsVSOut {
+    float4 pos  [[position]];
+    float3 nrm;
+    float3 wpos;
+};
+
+// Unit-sphere positions double as normals. Each instance reads its centre and
+// radius from the obstacle buffer.
+vertex ObsVSOut obstacle_vertex(uint vid [[vertex_id]],
+                                uint iid [[instance_id]],
+                                device const float3* unitVtx  [[buffer(0)]],
+                                device const float4* obstacles [[buffer(1)]],
+                                constant RenderUniforms& U     [[buffer(2)]])
+{
+    float3 n  = unitVtx[vid];
+    float4 ob = obstacles[iid];
+    float3 wp = ob.xyz + n * ob.w;
+
+    ObsVSOut o;
+    o.pos  = U.viewProj * float4(wp, 1.0);
+    o.nrm  = n;
+    o.wpos = wp;
+    return o;
+}
+
+// Matte diffuse + ambient + a cool fresnel rim. Values stay below 1.0 so the
+// spheres read as solid surfaces and do not feed the bloom.
+fragment float4 obstacle_fragment(ObsVSOut in [[stage_in]],
+                                  constant RenderUniforms& U [[buffer(0)]])
+{
+    float3 N = normalize(in.nrm);
+    float3 L = normalize(float3(0.4, 0.92, 0.35));
+    float3 V = normalize(U.eye.xyz - in.wpos);
+    float  diff = max(dot(N, L), 0.0);
+    float  amb  = 0.18;
+    float  fres = pow(1.0 - max(dot(N, V), 0.0), 3.0) * 0.45;
+
+    float3 base = float3(0.60, 0.30, 0.17);                  // warm matte
+    float3 col  = base * (amb + 0.90 * diff)
+                + fres * float3(0.35, 0.50, 0.85);           // cool rim
+    return float4(col, 1.0);
+}
+
 // bounding-box wireframe
 vertex float4 line_vertex(uint vid [[vertex_id]],
                           device const float3* p [[buffer(0)]],
@@ -306,6 +402,20 @@ fragment float4 bright_pass(FSOut in [[stage_in]],
     return float4(c * k, 1.0);
 }
 
+// Temporal trail: previous accumulation faded by `decay`, plus this frame's
+// bright pass. Long-lived bright/fast boids leave glowing streaks; the dim
+// box and the opaque spheres never enter the bright pass, so they don't smear.
+fragment float4 trail_pass(FSOut in [[stage_in]],
+                           texture2d<float> prev [[texture(0)]],
+                           texture2d<float> add  [[texture(1)]],
+                           sampler smp [[sampler(0)]],
+                           constant float& decay [[buffer(0)]])
+{
+    float3 p = prev.sample(smp, in.uv).rgb;
+    float3 a = add.sample(smp, in.uv).rgb;
+    return float4(p * decay + a, 1.0);
+}
+
 fragment float4 blur_pass(FSOut in [[stage_in]],
                           texture2d<float> tex [[texture(0)]],
                           sampler smp [[sampler(0)]],
@@ -328,11 +438,12 @@ static float3 acesTonemap(float3 x) {
 fragment float4 composite(FSOut in [[stage_in]],
                           texture2d<float> scene [[texture(0)]],
                           texture2d<float> bloom [[texture(1)]],
-                          sampler smp [[sampler(0)]])
+                          sampler smp [[sampler(0)]],
+                          constant float& bloomStrength [[buffer(0)]])
 {
     float3 c  = scene.sample(smp, in.uv).rgb;
     float3 bl = bloom.sample(smp, in.uv).rgb;
-    c += bl * 0.95;                                   // additive glow
+    c += bl * bloomStrength;                          // additive glow + trails
 
     float2 q   = in.uv - 0.5;
     float  vig = smoothstep(0.95, 0.30, length(q));   // soft vignette
